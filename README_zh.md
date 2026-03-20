@@ -4,170 +4,226 @@
 
 ## 1. 簡介與使用情境
 此文件旨在說明 `illumio_backup.sh` 備份腳本的運作原理、決策邏輯以及如何自定義修改以符合您的環境。
-此腳本可滿足在 Illumio PCE Cluster 架構下，自動識別主要節點、執行備份、轉移備份檔案至遠端 (SMB/NFS/SCP) 並實施檔案保留 (Retention) 策略。
+
+此腳本可滿足在 Illumio PCE Cluster 架構下：
+- 自動識別主要節點，避免雙重備份
+- 執行備份並傳輸到一個或多個目的地 (Local/SMB/NFS/SCP)
+- 依照設定的間隔天數決定是否執行備份（避免不必要的重複）
+- 在寫入備份前先確認目標磁碟空間充足
+- 自動執行檔案保留 (Retention) 清理
+
+---
 
 ## 2. 決策邏輯：為什麼這樣設計？
+
 ### 2.1 決定備份節點 (Determine the Primary Database)
-在 Illumio PCE 的高可用性 (HA) 架構中，雖然所有核心節點都在運作，但**資料庫只有在主要 (Primary) 節點才可進行備份操作**。
-根據官方手冊《Illumio Core 23.2 Administration.md》的指示，備份腳本必須從運行 `agent_traffic_redis_server` 服務的 Data Node 上執行。
+在 Illumio PCE 的高可用性 (HA) 架構中，**資料庫只有在主要 (Primary) 節點才可進行備份操作**。腳本使用 `illumio-pce-ctl cluster-status` 找出運行 `agent_traffic_redis_server` 的節點 IP，並比對自身 IP：
+- **是**：本機是 Primary 節點 → 繼續執行備份
+- **否**：本機是備用節點 → 記錄日誌並安全退出，不執行任何備份
 
-**腳本中的實作方式：**
-腳本會使用 `illumio-pce-ctl cluster-status` 指令，並過濾出運行 `agent_traffic_redis_server` 的節點 IP。
-接著腳本將比對自身的 IP 是否為該 Leader IP：
-- **是**：代表目前運行的這台伺服器是主要資料庫節點，腳本將繼續執行備份任務。
-- **否**：代表這台伺服器只是備用或是非主要節點，腳本將會印出日誌並**安全退出**，不會執行任何備份。
+這代表您可以在**所有**資料庫節點上設定相同的 Crontab，只有真正的 Primary 節點會執行備份。
 
-這代表您可以將此腳本部署並設定排程 (Cronjob) 於所有的資料庫節點上。時間一到，所有節點都會被喚醒，但**只有真正的 Primary 節點會執行備份**，避免產生衝突與無效的備份檔案。
+### 2.2 錯誤處理與日誌記錄
+腳本內建 `log` 函數，所有操作狀態都會：
+1. **寫入本地日誌檔案**：啟用 `--local` 時儲存於 `LOCAL_BACKUP_DIR/logs/`，否則寫至 `/tmp/illumio-backup/logs/`
+2. **傳送至 Syslog**：使用 `logger` 寫進 `/var/log/messages`，可整合至 SIEM (Splunk、QRadar 等)
 
-### 2.2 錯誤處理與日誌記錄 (Error Handling & Logging)
-腳本內建 `log` 函數，所有的操作狀態都會：
-1. **寫入本地日誌檔案**：儲存於 `/opt/illumio-backup/logs/` 內，方便未來除錯。
-2. **傳送至 System log (Syslog)**：腳本會使用 `logger` 將日誌送進 `/var/log/messages`。如果您有設定 SIEM (如 Splunk, QRadar 等)，即可直接蒐集這些 syslog 作為備份成功與否的監控指標。
+---
 
-## 3. 安裝與設定說明
-請在您想執行備份的 PCE 節點上執行以下步驟：
+## 3. 新功能說明 (v2)
 
-### 3.1 準備 SMB 網路作業系統掛載 (若有需要)
-如果您打算將備份檔案傳送到 Windows SMB 分享資料夾，必須事先掛載 SMB 目錄。
-請按以下步驟安裝相關套件與設定自動掛載：
+### 3.1 本地備份不再是預設，必須選擇至少一個目的地
+腳本現在要求執行時明確指定至少一個目的地。若未指定任何 flag，腳本將直接中止：
 
+```
+ERROR: 請至少指定一個備份目的地 (--local / --smb / --nfs / --scp)
+```
+
+若未選擇 `--local`，腳本會先將備份檔案寫入 `mktemp -d` 暫存目錄，傳輸完畢後自動清除，**本地不會留下任何備份複本**。
+
+### 3.2 備份頻率可自行設定
+腳本會根據目的地中**最後一個備份檔案的修改時間**，判斷是否需要執行備份：
+
+| 參數 | 預設 | 說明 |
+|------|------|------|
+| `--db-interval <天>` | `1` | Policy DB 及 runtime_env 備份間隔（天）|
+| `--traffic-interval <天>` | `7` | Traffic DB 備份間隔（天）|
+
+若目的地中找不到任何先前的備份檔，視為「首次備份」，強制執行。
+
+### 3.3 磁碟容量預先檢查
+在每個目的地**寫入備份前**，腳本會確認剩餘空間是否高於門檻，若不足則立即中止並記錄錯誤。
+
+| 參數 | 預設 | 適用目標 |
+|------|------|---------|
+| `--min-free-local <GB>` | `5` | 本地備份目錄 |
+| `--min-free-share <GB>` | `10` | SMB / NFS 掛載點 |
+| `--min-free-remote <GB>` | `10` | SCP 遠端主機（透過 SSH 查詢）|
+
+---
+
+## 4. 安裝與設定說明
+
+### 4.1 準備 SMB 網路掛載 (若有需要)
 1. **安裝 CIFS 套件**：
    ```bash
    dnf install cifs-utils -y
    ```
-
 2. **建立 SMB 認證金鑰檔**：
-   為了安全性，避免在設定檔中明文存放密碼，請建立憑證檔案：
    ```bash
    vi /root/smb.cred
    ```
-   **內容如下：**
    ```ini
    username=您的SMB帳號
    password=您的SMB密碼
    domain=您的網域名稱 (若無可省略)
    ```
-   設定金鑰檔權限：
    ```bash
    chmod 600 /root/smb.cred
    ```
-
 3. **設定開機自動掛載 (`/etc/fstab`)**：
-   新增以下內容到 `/etc/fstab`：
-   ```bash
-   //您的SMB伺服器IP或域名/分享資料夾路徑 /mnt/smb  cifs  credentials=/root/smb.cred  0 0
    ```
-   *建立掛載目錄並載入：*
+   //您的SMB伺服器/分享路徑 /mnt/smb  cifs  credentials=/root/smb.cred  0 0
+   ```
    ```bash
-   mkdir -p /mnt/smb
-   sudo mount -a
-   systemctl daemon-reload
+   mkdir -p /mnt/smb && sudo mount -a
    ```
 
-### 3.2 準備 NFS 網路掛載 (若有需要)
-如果您打算將備份檔案傳送到 Linux/Unix 相容的 NFS 分享目錄，請進行以下掛載設定。
-*(註：傳統的 NFS (v3/v4) **不需要**輸入帳號與密碼，而是依賴 NFS Server 端的 `/etc/exports` 設定來控制哪些 IP 或白名單來源可以存取與掛載。)*
-
+### 4.2 準備 NFS 網路掛載 (若有需要)
+*(NFS v3/v4 不需帳號密碼，依賴 Server 端 `/etc/exports` 控制來源 IP)*
 1. **安裝 NFS 工具**：
    ```bash
    dnf install nfs-utils -y
    ```
-
 2. **設定開機自動掛載 (`/etc/fstab`)**：
-   新增以下內容到 `/etc/fstab`：
-   ```bash
-   您的NFS伺服器IP或域名:/分享資料夾路徑 /mnt/nfs  nfs  defaults  0 0
    ```
-   *建立掛載目錄並載入：*
+   您的NFS伺服器IP:/分享路徑 /mnt/nfs  nfs  defaults  0 0
+   ```
    ```bash
-   mkdir -p /mnt/nfs
-   sudo mount -a
-   systemctl daemon-reload
+   mkdir -p /mnt/nfs && sudo mount -a
    ```
 
-### 3.3 準備 SCP 免密碼登入 (若有需要)
-如果您打算將備份檔案傳輸到另一台遠端主機，必須設定 SSH 免密碼登入。
-
-1. **產生 SSH 金鑰對 (若尚未產生)**：
-   (過程中一路按 Enter 即可，**不要設定密碼 passphrase**) 
+### 4.3 準備 SCP 免密碼登入 (若有需要)
+1. **產生 SSH 金鑰對**（不要設定 passphrase）：
    ```bash
    ssh-keygen -t rsa -b 4096
    ```
-
 2. **將公鑰傳送至遠端備份主機**：
    ```bash
-   ssh-copy-id 目標使用者名稱@遠端主機IP
+   ssh-copy-id 目標使用者@遠端主機IP
    ```
-
 3. **測試連線**：
-   嘗試登入，確認不需要輸入密碼即可成功連線：
    ```bash
-   ssh 目標使用者名稱@遠端主機IP "ls -l"
+   ssh 目標使用者@遠端主機IP "ls -l"
    ```
 
-### 3.4 準備腳本
-1. 將腳本上傳至伺服器，例如放置於 `/usr/local/bin/illumio_backup.sh`。
+### 4.4 準備腳本
+1. 上傳腳本至伺服器，例如 `/usr/local/bin/illumio_backup.sh`
 2. 賦予執行權限：
    ```bash
    chmod +x /usr/local/bin/illumio_backup.sh
    ```
 
-### 3.5 自定義變數 (Configuration Variables)
-請使用文字編輯器打開腳本，並根據環境修改以下核心變數：
-
+### 4.5 自定義變數 (Configuration Variables)
+開啟腳本，在 `[SCRIPT CONFIGURATION]` 區段根據環境修改以下預設值：
 
 ```bash
 # 1. 本地備份設定
-LOCAL_BACKUP_DIR="/opt/illumio-backup"    # 本地備份與日誌放置的目錄
-RETENTION_DB_DAYS=7                       # Policy DB 與 Runtime Env 要保留的天數
-RETENTION_TRAFFIC_DAYS=14                 # Traffic DB 要保留的天數
+LOCAL_BACKUP_DIR="/opt/illumio-backup"    # 備份檔案與日誌目錄
+RETENTION_DB_DAYS=7                       # Policy DB / runtime_env 保留天數
+RETENTION_TRAFFIC_DAYS=14                # Traffic DB 保留天數
 
-# 2. SMB/NFS 設定 (若不啟用可忽略)
-SMB_MOUNT_POINT="/mnt/smb/illumio-backup" # SMB 網路磁碟機掛載點
-NFS_MOUNT_POINT="/mnt/nfs/illumio-backup" # NFS 網路磁碟機掛載點
+# 2. SMB/NFS 設定 (不啟用可忽略)
+SMB_MOUNT_POINT="/mnt/smb/illumio-backup"
+NFS_MOUNT_POINT="/mnt/nfs/illumio-backup"
 
-# 3. SCP (異地備援) 設定 (若不啟用可忽略)
-DR_USER="root"                            # SCP 遠端登入帳號
-DR_HOST="172.16.15.131"                   # SCP 遠端主機 IP
-DR_DEST_DIR="/opt/illumio-backup"         # SCP 遠端主機儲存目錄
+# 3. SCP 設定 (不啟用可忽略)
+DR_USER="root"
+DR_HOST="172.16.15.131"
+DR_DEST_DIR="/opt/illumio-backup"
+SCP_TIMEOUT=30
+
+# 4. 磁碟空間門檻 (GB)
+MIN_FREE_GB_LOCAL=5
+MIN_FREE_GB_SHARE=10
+MIN_FREE_GB_REMOTE=10
+
+# 5. 備份頻率 (天)
+DB_INTERVAL=1       # Policy DB / runtime_env 備份間隔
+TRAFFIC_INTERVAL=7  # Traffic DB 備份間隔
 ```
 
-### 3.6 執行與參數
-本腳本支援透過參數來決定備份要傳送到哪裡：
+---
 
-- **僅存放在本地：**
-  ```bash
-  /usr/local/bin/illumio_backup.sh
-  ```
-- **備份並傳送到 SMB 及 NFS：**
-  ```bash
-  /usr/local/bin/illumio_backup.sh --smb --nfs
-  ```
-- **備份並透過 SCP 傳送到遠端主機：**
-  *(註：此功能需依賴 3.3 步驟完成免密碼設定)*
-  ```bash
-  /usr/local/bin/illumio_backup.sh --scp
-  ```
+## 5. 執行與參數說明
 
-### 3.7 設定排程 (Crontab)
-為了自動化備份，請使用 `crontab -e` 加入以下排程 (舉例為每天凌晨 2 點執行，並傳送到 SCP 與 SMB)：
+### 5.1 完整參數列表
+```
+目的地（至少選一）:
+  --local                  備份至本地目錄
+  --smb                    複製至 SMB/CIFS 共用資料夾
+  --nfs                    複製至 NFS 共用目錄
+  --scp                    透過 SCP 傳輸至遠端主機
+
+頻率:
+  --db-interval <天>       Policy DB 備份間隔（預設: 1）
+  --traffic-interval <天>  Traffic DB 備份間隔（預設: 7）
+
+保留期限:
+  --retention-db <天>      DB/Env 保留天數（預設: 7）
+  --retention-traffic <天> Traffic 保留天數（預設: 14）
+
+磁碟空間門檻:
+  --min-free-local <GB>    本地最低剩餘空間（預設: 5）
+  --min-free-share <GB>    SMB/NFS 最低剩餘空間（預設: 10）
+  --min-free-remote <GB>   遠端主機最低剩餘空間（預設: 10）
+```
+
+### 5.2 常用範例
 
 ```bash
-0 2 * * * /usr/local/bin/illumio_backup.sh --smb --scp >/dev/null 2>&1
+# 只存本地
+/usr/local/bin/illumio_backup.sh --local
+
+# 只存 SMB，不保留本地複本
+/usr/local/bin/illumio_backup.sh --smb
+
+# 本地 + SCP 雙份
+/usr/local/bin/illumio_backup.sh --local --scp
+
+# 傳到 SMB + NFS，Policy DB 每 3 天、Traffic 每 14 天
+/usr/local/bin/illumio_backup.sh --smb --nfs --db-interval 3 --traffic-interval 14
+
+# 自訂磁碟門檻
+/usr/local/bin/illumio_backup.sh --local --smb --min-free-local 20 --min-free-share 50
 ```
 
-## 4. 備份內容與頻率
-本腳本涵蓋 Illumio PCE 的三大關鍵資料：
-1. **`runtime_env.yml`**: PCE 運行環境設定檔 (每次備份皆會複製)。
-2. **Policy Database**: 包含策略、物件、Workload 等設定 (每次備份皆會 Dump)。
-3. **Traffic Database**: 包含流量紀錄 (Traffic Flow)。因為檔案通常極大，**腳本預設只有在星期日 (Sunday) 才會執行 Traffic 備份**。
+### 5.3 設定排程 (Crontab)
+```bash
+crontab -e
+```
+```bash
+# 每天凌晨 2 點：備份到 SMB + SCP
+0 2 * * * /usr/local/bin/illumio_backup.sh --smb --scp >/dev/null 2>&1
 
-## 5. 檔案保留策略 (Cleanup)
-為了避免磁碟空間塞滿，腳本會在每個傳輸目標 (本地、SMB、NFS、SCP) 上執行清除動作。清除的條件依照 `RETENTION_DB_DAYS` 和 `RETENTION_TRAFFIC_DAYS` 設定。
-只有超過這些天數的檔案兩端的備份點才會被刪除。腳本日誌預設保留 30 天。
+# 每天凌晨 2 點：本地 + SMB，Traffic 每 14 天備份一次
+0 2 * * * /usr/local/bin/illumio_backup.sh --local --smb --traffic-interval 14 >/dev/null 2>&1
+```
 
-## 6. 其他常用指令 (依據手冊)
-如果需要手動還原，請參考以下流程：
+---
+
+## 6. 備份內容與操作注意事項
+
+- **`runtime_env.yml`**：每次符合頻率條件時備份（跟隨 `--db-interval`）
+- **Policy Database**：每次符合頻率條件時 Dump（跟隨 `--db-interval`）
+- **Traffic Database**：依 `--traffic-interval` 執行（預設每 7 天）；舊版的星期日硬編碼已移除
+- **日誌位置**：啟用 `--local` 時位於 `LOCAL_BACKUP_DIR/logs/`；未啟用時位於 `/tmp/illumio-backup/logs/`，同時寫入 syslog
+- **保留清理**：每次執行後，所有已啟用目的地都會自動清除超過保留天數的舊備份
+- **沒有選目的地**：腳本立即印出錯誤並退出，不進行任何備份
+
+---
+
+## 7. 其他常用指令 (手動還原)
 
 ```bash
 # 停止服務
