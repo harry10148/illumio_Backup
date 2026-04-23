@@ -71,6 +71,10 @@ Usage: $(basename "$0") [OPTIONS]
 EOF
 }
 
+is_positive_int() {
+    [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
         --local)   ENABLE_LOCAL=true ;;
@@ -78,25 +82,46 @@ while [[ "$#" -gt 0 ]]; do
         --nfs)     ENABLE_NFS=true ;;
         --scp)     ENABLE_SCP=true ;;
         --db-interval)
-            [[ -z "$2" || ! "$2" =~ ^[0-9]+$ ]] && { echo "ERROR: --db-interval 需要一個正整數" >&2; exit 1; }
+            if [[ -z "$2" ]] || ! is_positive_int "$2"; then
+                echo "ERROR: --db-interval 需要一個正整數" >&2
+                exit 1
+            fi
             DB_INTERVAL="$2"; shift ;;
         --traffic-interval)
-            [[ -z "$2" || ! "$2" =~ ^[0-9]+$ ]] && { echo "ERROR: --traffic-interval 需要一個正整數" >&2; exit 1; }
+            if [[ -z "$2" ]] || ! is_positive_int "$2"; then
+                echo "ERROR: --traffic-interval 需要一個正整數" >&2
+                exit 1
+            fi
             TRAFFIC_INTERVAL="$2"; shift ;;
         --retention-db)
-            [[ -z "$2" || ! "$2" =~ ^[0-9]+$ ]] && { echo "ERROR: --retention-db 需要一個正整數" >&2; exit 1; }
+            if [[ -z "$2" ]] || ! is_positive_int "$2"; then
+                echo "ERROR: --retention-db 需要一個正整數" >&2
+                exit 1
+            fi
             RETENTION_DB_DAYS="$2"; shift ;;
         --retention-traffic)
-            [[ -z "$2" || ! "$2" =~ ^[0-9]+$ ]] && { echo "ERROR: --retention-traffic 需要一個正整數" >&2; exit 1; }
+            if [[ -z "$2" ]] || ! is_positive_int "$2"; then
+                echo "ERROR: --retention-traffic 需要一個正整數" >&2
+                exit 1
+            fi
             RETENTION_TRAFFIC_DAYS="$2"; shift ;;
         --min-free-local)
-            [[ -z "$2" || ! "$2" =~ ^[0-9]+$ ]] && { echo "ERROR: --min-free-local 需要一個正整數" >&2; exit 1; }
+            if [[ -z "$2" ]] || ! is_positive_int "$2"; then
+                echo "ERROR: --min-free-local 需要一個正整數" >&2
+                exit 1
+            fi
             MIN_FREE_GB_LOCAL="$2"; shift ;;
         --min-free-share)
-            [[ -z "$2" || ! "$2" =~ ^[0-9]+$ ]] && { echo "ERROR: --min-free-share 需要一個正整數" >&2; exit 1; }
+            if [[ -z "$2" ]] || ! is_positive_int "$2"; then
+                echo "ERROR: --min-free-share 需要一個正整數" >&2
+                exit 1
+            fi
             MIN_FREE_GB_SHARE="$2"; shift ;;
         --min-free-remote)
-            [[ -z "$2" || ! "$2" =~ ^[0-9]+$ ]] && { echo "ERROR: --min-free-remote 需要一個正整數" >&2; exit 1; }
+            if [[ -z "$2" ]] || ! is_positive_int "$2"; then
+                echo "ERROR: --min-free-remote 需要一個正整數" >&2
+                exit 1
+            fi
             MIN_FREE_GB_REMOTE="$2"; shift ;;
         --help|-h) usage; exit 0 ;;
         *) echo "ERROR: 未知參數: $1" >&2; usage >&2; exit 1 ;;
@@ -126,6 +151,7 @@ else
     LOG_DIR="/tmp/illumio-backup/logs"
 fi
 LOG_FILE="${LOG_DIR}/backup_$(date +%Y%m%d_%H%M%S).log"
+HARD_FAILURE=false
 
 # ==============================================================================
 # HELPER FUNCTIONS
@@ -170,6 +196,14 @@ setup_env() {
             log "WARN" "無法 chown $LOCAL_BACKUP_DIR (需要 root 權限)，請手動確認目錄擁有者"
         fi
     fi
+}
+
+is_smb_ready() {
+    [[ -d "$SMB_MOUNT_POINT" ]] && df -T "$SMB_MOUNT_POINT" 2>/dev/null | grep -qE "cifs|smb"
+}
+
+is_nfs_ready() {
+    [[ -d "$NFS_MOUNT_POINT" ]] && df -T "$NFS_MOUNT_POINT" 2>/dev/null | grep -q "nfs"
 }
 
 # ------------------------------------------------------------------------------
@@ -248,6 +282,56 @@ days_since_last_backup() {
     echo "$DIFF"
 }
 
+remote_days_since_last_backup() {
+    local PATTERN="$1"
+    local LAST_MTIME
+
+    LAST_MTIME=$(ssh -o ConnectTimeout=10 -o BatchMode=yes "$DR_USER@$DR_HOST" \
+        "find '$DR_DEST_DIR' -maxdepth 1 -name '$PATTERN' -printf '%T@\n' 2>/dev/null | sort -n | tail -1" \
+        2>/dev/null)
+
+    if [[ -z "$LAST_MTIME" ]]; then
+        echo 9999
+        return
+    fi
+
+    LAST_MTIME=${LAST_MTIME%.*}
+    [[ "$LAST_MTIME" =~ ^[0-9]+$ ]] || { echo 9999; return; }
+
+    local NOW DIFF
+    NOW=$(date +%s)
+    DIFF=$(( (NOW - LAST_MTIME) / 86400 ))
+    echo "$DIFF"
+}
+
+days_since_last_backup_enabled_destinations() {
+    local PATTERN="$1"
+    local MIN_DAYS=9999
+    local DAYS
+
+    if [[ "$ENABLE_LOCAL" == true ]]; then
+        DAYS=$(days_since_last_backup "$LOCAL_BACKUP_DIR" "$PATTERN")
+        [[ "$DAYS" -lt "$MIN_DAYS" ]] && MIN_DAYS="$DAYS"
+    fi
+
+    if [[ "$ENABLE_SMB" == true ]] && is_smb_ready; then
+        DAYS=$(days_since_last_backup "$SMB_MOUNT_POINT" "$PATTERN")
+        [[ "$DAYS" -lt "$MIN_DAYS" ]] && MIN_DAYS="$DAYS"
+    fi
+
+    if [[ "$ENABLE_NFS" == true ]] && is_nfs_ready; then
+        DAYS=$(days_since_last_backup "$NFS_MOUNT_POINT" "$PATTERN")
+        [[ "$DAYS" -lt "$MIN_DAYS" ]] && MIN_DAYS="$DAYS"
+    fi
+
+    if [[ "$ENABLE_SCP" == true ]]; then
+        DAYS=$(remote_days_since_last_backup "$PATTERN")
+        [[ "$DAYS" -lt "$MIN_DAYS" ]] && MIN_DAYS="$DAYS"
+    fi
+
+    echo "$MIN_DAYS"
+}
+
 # ------------------------------------------------------------------------------
 # should_run_backup — 判斷此次是否應執行備份
 #   $1: 備份類型描述
@@ -276,13 +360,19 @@ should_run_backup() {
 process_file() {
     local FILE_PATH="$1"
     local FILE_NAME
+    local STORED=false
     FILE_NAME=$(basename "$FILE_PATH")
+
+    if [[ "$ENABLE_LOCAL" == true ]] && [[ -f "$FILE_PATH" ]]; then
+        STORED=true
+    fi
 
     # 1. SMB Transfer
     if [[ "$ENABLE_SMB" == true ]]; then
-        if [[ -d "$SMB_MOUNT_POINT" ]] && df -T "$SMB_MOUNT_POINT" 2>/dev/null | grep -qE "cifs|smb"; then
+        if is_smb_ready; then
             if cp -p "$FILE_PATH" "$SMB_MOUNT_POINT/"; then
                 log "INFO" "[SMB] Copy Success: $FILE_NAME"
+                STORED=true
             else
                 log "ERROR" "[SMB] Copy Failed: $FILE_NAME"
             fi
@@ -293,9 +383,10 @@ process_file() {
 
     # 2. NFS Transfer
     if [[ "$ENABLE_NFS" == true ]]; then
-        if [[ -d "$NFS_MOUNT_POINT" ]] && df -T "$NFS_MOUNT_POINT" 2>/dev/null | grep -q "nfs"; then
+        if is_nfs_ready; then
             if cp -p "$FILE_PATH" "$NFS_MOUNT_POINT/"; then
                 log "INFO" "[NFS] Copy Success: $FILE_NAME"
+                STORED=true
             else
                 log "ERROR" "[NFS] Copy Failed: $FILE_NAME"
             fi
@@ -309,6 +400,7 @@ process_file() {
         if ssh -o ConnectTimeout=10 -o BatchMode=yes "$DR_USER@$DR_HOST" "mkdir -p $DR_DEST_DIR" 2>/dev/null; then
             if scp -o ConnectTimeout="${SCP_TIMEOUT}" -p "$FILE_PATH" "$DR_USER@$DR_HOST:$DR_DEST_DIR/"; then
                 log "INFO" "[SCP] Transfer Success: $FILE_NAME"
+                STORED=true
             else
                 log "ERROR" "[SCP] Transfer Failed: $FILE_NAME"
             fi
@@ -316,6 +408,13 @@ process_file() {
             log "ERROR" "[SCP] 無法連線到遠端主機 ${DR_HOST}，跳過 $FILE_NAME"
         fi
     fi
+
+    if [[ "$STORED" == false ]]; then
+        log "ERROR" "[DEST] 所有目的地均未成功保存檔案: $FILE_NAME"
+        return 1
+    fi
+
+    return 0
 }
 
 # ==============================================================================
@@ -357,11 +456,11 @@ if [[ "$ENABLE_LOCAL" == true ]]; then
     check_disk_space "$LOCAL_BACKUP_DIR" "$MIN_FREE_GB_LOCAL" "本地備份目錄"
 fi
 
-if [[ "$ENABLE_SMB" == true ]] && [[ -d "$SMB_MOUNT_POINT" ]]; then
+if [[ "$ENABLE_SMB" == true ]] && is_smb_ready; then
     check_disk_space "$SMB_MOUNT_POINT" "$MIN_FREE_GB_SHARE" "SMB Fileshare"
 fi
 
-if [[ "$ENABLE_NFS" == true ]] && [[ -d "$NFS_MOUNT_POINT" ]]; then
+if [[ "$ENABLE_NFS" == true ]] && is_nfs_ready; then
     check_disk_space "$NFS_MOUNT_POINT" "$MIN_FREE_GB_SHARE" "NFS Fileshare"
 fi
 
@@ -378,10 +477,11 @@ fi
 if [[ "$ENABLE_LOCAL" == true ]]; then
     WORK_DIR="$LOCAL_BACKUP_DIR"
 else
+    PRESERVE_WORK_DIR=false
     WORK_DIR=$(mktemp -d /tmp/illumio-backup-XXXXXX)
     log "INFO" "本地備份未啟用，使用暫存目錄: $WORK_DIR"
     # 腳本結束時清除暫存目錄
-    trap 'rm -rf "$WORK_DIR"' EXIT
+    trap '[[ "$PRESERVE_WORK_DIR" == true ]] || rm -rf "$WORK_DIR"' EXIT
 fi
 
 # --- 2-1. Backup Runtime Environment File ---
@@ -390,14 +490,21 @@ RUNTIME_FILE="runtime_env_${TODAY}.yml"
 RUNTIME_FULL_PATH="${WORK_DIR}/${RUNTIME_FILE}"
 
 # 頻率檢查 (runtime_env 跟隨 DB 間隔)
-DAYS_SINCE_ENV=$(days_since_last_backup "$WORK_DIR" "runtime_env_*.yml")
+DAYS_SINCE_ENV=$(days_since_last_backup_enabled_destinations "runtime_env_*.yml")
 if should_run_backup "Runtime Env" "$DB_INTERVAL" "$DAYS_SINCE_ENV"; then
     if [[ -f /etc/illumio-pce/runtime_env.yml ]]; then
         if cp /etc/illumio-pce/runtime_env.yml "$RUNTIME_FULL_PATH"; then
             log "INFO" "Runtime env 備份至 $RUNTIME_FULL_PATH"
-            process_file "$RUNTIME_FULL_PATH"
-            # 若本地未啟用，轉送完畢後刪除暫存檔
-            [[ "$ENABLE_LOCAL" == false ]] && rm -f "$RUNTIME_FULL_PATH"
+            if process_file "$RUNTIME_FULL_PATH"; then
+                # 若本地未啟用，轉送完畢後刪除暫存檔
+                [[ "$ENABLE_LOCAL" == false ]] && rm -f "$RUNTIME_FULL_PATH"
+            else
+                HARD_FAILURE=true
+                if [[ "$ENABLE_LOCAL" == false ]]; then
+                    PRESERVE_WORK_DIR=true
+                    log "ERROR" "[DEST] 保留暫存檔供排查: $RUNTIME_FULL_PATH"
+                fi
+            fi
         else
             log "ERROR" "無法複製 runtime_env.yml 到工作目錄"
         fi
@@ -412,13 +519,20 @@ DB_FILE="ilo-db-bak-${TODAY}.dump"
 FULL_DB_PATH="${WORK_DIR}/${DB_FILE}"
 
 # 頻率檢查
-DAYS_SINCE_DB=$(days_since_last_backup "$WORK_DIR" "ilo-db-bak-*.dump")
+DAYS_SINCE_DB=$(days_since_last_backup_enabled_destinations "ilo-db-bak-*.dump")
 if should_run_backup "Policy DB" "$DB_INTERVAL" "$DAYS_SINCE_DB"; then
     if sudo -u ilo-pce illumio-pce-db-management dump --file "$FULL_DB_PATH" >> "$LOG_FILE" 2>&1; then
         if [[ -f "$FULL_DB_PATH" ]]; then
             log "INFO" "Policy DB 備份成功: $DB_FILE"
-            process_file "$FULL_DB_PATH"
-            [[ "$ENABLE_LOCAL" == false ]] && rm -f "$FULL_DB_PATH"
+            if process_file "$FULL_DB_PATH"; then
+                [[ "$ENABLE_LOCAL" == false ]] && rm -f "$FULL_DB_PATH"
+            else
+                HARD_FAILURE=true
+                if [[ "$ENABLE_LOCAL" == false ]]; then
+                    PRESERVE_WORK_DIR=true
+                    log "ERROR" "[DEST] 保留暫存檔供排查: $FULL_DB_PATH"
+                fi
+            fi
         else
             log "ERROR" "Policy DB 命令完成，但找不到輸出檔案: $FULL_DB_PATH"
         fi
@@ -432,13 +546,20 @@ log "INFO" "[TASK] 檢查 Traffic Database 備份頻率"
 TRAFFIC_FILE="ilo-traffic-bak-${TODAY}.tar.gz"
 FULL_TRAFFIC_PATH="${WORK_DIR}/${TRAFFIC_FILE}"
 
-DAYS_SINCE_TRAFFIC=$(days_since_last_backup "$WORK_DIR" "ilo-traffic-bak-*.tar.gz")
+DAYS_SINCE_TRAFFIC=$(days_since_last_backup_enabled_destinations "ilo-traffic-bak-*.tar.gz")
 if should_run_backup "Traffic DB" "$TRAFFIC_INTERVAL" "$DAYS_SINCE_TRAFFIC"; then
     if sudo -u ilo-pce illumio-pce-db-management traffic dump --file "$FULL_TRAFFIC_PATH" >> "$LOG_FILE" 2>&1; then
         if [[ -f "$FULL_TRAFFIC_PATH" ]]; then
             log "INFO" "Traffic DB 備份成功: $TRAFFIC_FILE"
-            process_file "$FULL_TRAFFIC_PATH"
-            [[ "$ENABLE_LOCAL" == false ]] && rm -f "$FULL_TRAFFIC_PATH"
+            if process_file "$FULL_TRAFFIC_PATH"; then
+                [[ "$ENABLE_LOCAL" == false ]] && rm -f "$FULL_TRAFFIC_PATH"
+            else
+                HARD_FAILURE=true
+                if [[ "$ENABLE_LOCAL" == false ]]; then
+                    PRESERVE_WORK_DIR=true
+                    log "ERROR" "[DEST] 保留暫存檔供排查: $FULL_TRAFFIC_PATH"
+                fi
+            fi
         else
             log "ERROR" "Traffic DB 命令完成，但找不到輸出檔案: $FULL_TRAFFIC_PATH"
         fi
@@ -477,15 +598,13 @@ fi
 
 # 2. SMB Cleanup
 if [[ "$ENABLE_SMB" == true ]] && \
-   [[ -d "$SMB_MOUNT_POINT" ]] && \
-   df -T "$SMB_MOUNT_POINT" 2>/dev/null | grep -qE "cifs|smb"; then
+   is_smb_ready; then
     cleanup_dir "$SMB_MOUNT_POINT" "SMB"
 fi
 
 # 3. NFS Cleanup
 if [[ "$ENABLE_NFS" == true ]] && \
-   [[ -d "$NFS_MOUNT_POINT" ]] && \
-   df -T "$NFS_MOUNT_POINT" 2>/dev/null | grep -q "nfs"; then
+   is_nfs_ready; then
     cleanup_dir "$NFS_MOUNT_POINT" "NFS"
 fi
 
@@ -502,6 +621,12 @@ fi
 # 5. Log Cleanup (保留 30 天)
 log "INFO" "[CLEANUP] 清理舊 log 檔 (保留 30 天)..."
 find "$LOG_DIR" -type f -name 'backup_*.log' -mtime +30 -delete
+
+if [[ "$HARD_FAILURE" == true ]]; then
+    log "ERROR" "Backup Process Completed With Errors."
+    log "ERROR" "========================================="
+    exit 1
+fi
 
 log "INFO" "Backup Process Completed Successfully."
 log "INFO" "========================================="
