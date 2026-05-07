@@ -32,17 +32,20 @@ Local backup is **no longer the default**. You must explicitly choose at least o
 ERROR: 請至少指定一個備份目的地 (--local / --smb / --nfs / --scp)
 ```
 
-When `--local` is **not** selected, the script uses a temporary directory (`mktemp -d`) to stage the backup file before transferring it. The temp directory is automatically removed when the script exits.
+When `--local` is **not** selected, the script uses a temporary directory (`mktemp -d`) to stage the backup file before transferring it. The temp directory is automatically removed when the script exits — **except** when every enabled remote destination fails for that file, in which case the temp directory is intentionally preserved and its path is printed in the ERROR log to support investigation.
 
 ### 2.2 Configurable Backup Frequency
-Instead of always running every execution, the script checks the modification time of the most recent backup file to determine whether a new backup is needed.
+Instead of always running every execution, the script checks the modification time of the most recent backup file on each enabled destination to decide whether a new backup is needed.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--db-interval <days>` | `1` | Run Policy DB backup every N days |
 | `--traffic-interval <days>` | `7` | Run Traffic DB backup every N days |
 
-If no previous backup file is found, the backup runs unconditionally (treating it as "never backed up").
+When multiple destinations are enabled, the script uses the **maximum age across all of them** — i.e. the cadence is driven by the destination that is furthest behind. This means:
+
+- If a destination is missing a copy (e.g. you just added `--scp` for the first time), the script treats that destination as "never backed up" (9999 days) and triggers a fresh backup cycle to seed it.
+- A backup is skipped only when **every** enabled destination already has a copy newer than the configured interval.
 
 ### 2.3 Disk Space Guard
 Before writing any backup file, the script checks available disk space on each enabled destination. If the free space is below the threshold, the script aborts with an error.
@@ -116,12 +119,12 @@ TRAFFIC_INTERVAL=7   # Traffic DB interval
    ```bash
    chmod 600 /root/smb.cred
    ```
-3. **Configure automatic mount (`/etc/fstab`)**:
+3. **Configure automatic mount (`/etc/fstab`)** — note that the mount target must match `SMB_MOUNT_POINT` in the script (default `/mnt/smb/illumio-backup`):
    ```
-   //YOUR_SMB_SERVER/SHARE /mnt/smb  cifs  credentials=/root/smb.cred  0 0
+   //YOUR_SMB_SERVER/SHARE /mnt/smb/illumio-backup  cifs  credentials=/root/smb.cred  0 0
    ```
    ```bash
-   mkdir -p /mnt/smb && sudo mount -a
+   mkdir -p /mnt/smb/illumio-backup && sudo mount -a
    ```
 
 ### 4.2 NFS Mount
@@ -130,12 +133,12 @@ TRAFFIC_INTERVAL=7   # Traffic DB interval
    ```bash
    dnf install nfs-utils -y
    ```
-2. **Configure automatic mount (`/etc/fstab`)**:
+2. **Configure automatic mount (`/etc/fstab`)** — the mount target must match `NFS_MOUNT_POINT` in the script (default `/mnt/nfs/illumio-backup`):
    ```
-   YOUR_NFS_SERVER:/SHARE /mnt/nfs  nfs  defaults  0 0
+   YOUR_NFS_SERVER:/SHARE /mnt/nfs/illumio-backup  nfs  defaults  0 0
    ```
    ```bash
-   mkdir -p /mnt/nfs && sudo mount -a
+   mkdir -p /mnt/nfs/illumio-backup && sudo mount -a
    ```
 
 ### 4.3 SCP Passwordless Login
@@ -176,6 +179,9 @@ Disk Space Threshold:
   --min-free-local <GB>    Min free space for local dir (default: 5)
   --min-free-share <GB>    Min free space for SMB/NFS (default: 10)
   --min-free-remote <GB>   Min free space on remote host (default: 10)
+
+Other:
+  --help, -h               Print usage and exit
 ```
 
 ### 5.2 Common Examples
@@ -217,8 +223,8 @@ crontab -e
   - `runtime_env.yml`: Backed up on every qualifying run (follows `--db-interval`).
   - **Policy Database**: Dumped on every qualifying run (follows `--db-interval`).
   - **Traffic Database**: Backed up according to `--traffic-interval` (default: every 7 days). The old Sunday-only hard-code has been removed.
-- **Log Location**: Logs are written to `LOCAL_BACKUP_DIR/logs/` (if `--local` is active) or `/tmp/illumio-backup/logs/`, and forwarded to `/var/log/messages` via syslog.
-- **Retention**: Old files are cleaned up automatically on each enabled destination after every run.
+- **Log Location**: Logs are written to `LOCAL_BACKUP_DIR/logs/` (if `--local` is active) or `/tmp/illumio-backup/logs/`, and forwarded to `/var/log/messages` via syslog. Log files (`backup_*.log`) older than 30 days are removed automatically at the end of each successful run.
+- **Retention**: Old files are cleaned up automatically on each enabled destination after every run. **Exception**: if any backup task hard-fails (no destination accepted the file), retention cleanup is skipped for that run so the previous good copies are preserved.
 - **No destination selected**: The script exits immediately with a clear error message; no backup is attempted.
 
 ---

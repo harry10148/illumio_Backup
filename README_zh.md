@@ -39,17 +39,22 @@
 ERROR: 請至少指定一個備份目的地 (--local / --smb / --nfs / --scp)
 ```
 
-若未選擇 `--local`，腳本會先將備份檔案寫入 `mktemp -d` 暫存目錄，傳輸完畢後自動清除，**本地不會留下任何備份複本**。
+若未選擇 `--local`，腳本會先將備份檔案寫入 `mktemp -d` 暫存目錄，傳輸完畢後自動清除，**本地不會留下任何備份複本**；唯一例外是當該備份檔在所有啟用的遠端目的地都傳輸失敗時，暫存目錄會刻意保留，路徑會印在 ERROR 日誌中以利排查。
 
 ### 3.2 備份頻率可自行設定
-腳本會根據目的地中**最後一個備份檔案的修改時間**，判斷是否需要執行備份：
+腳本會檢查每個啟用目的地中**最後一個備份檔案的修改時間**，判斷是否需要執行備份：
 
 | 參數 | 預設 | 說明 |
 |------|------|------|
 | `--db-interval <天>` | `1` | Policy DB 及 runtime_env 備份間隔（天）|
 | `--traffic-interval <天>` | `7` | Traffic DB 備份間隔（天）|
 
-若目的地中找不到任何先前的備份檔，視為「首次備份」，強制執行。
+啟用多個目的地時，腳本會以**所有目的地中最久沒備份的那一個**為準，因此：
+
+- 若有任何目的地缺少對應備份檔（例如剛新增 `--scp` 還沒任何檔案），會被視為「從未備份」（9999 天）並立即觸發補齊
+- 只有當**所有**啟用的目的地都已有比間隔天數更新的備份時，本次才會被跳過
+
+若所有目的地皆找不到先前的備份檔，視為「首次備份」，強制執行。
 
 ### 3.3 磁碟容量預先檢查
 在每個目的地**寫入備份前**，腳本會確認剩餘空間是否高於門檻，若不足則立即中止並記錄錯誤。
@@ -81,12 +86,12 @@ ERROR: 請至少指定一個備份目的地 (--local / --smb / --nfs / --scp)
    ```bash
    chmod 600 /root/smb.cred
    ```
-3. **設定開機自動掛載 (`/etc/fstab`)**：
+3. **設定開機自動掛載 (`/etc/fstab`)** — 掛載點必須與腳本中的 `SMB_MOUNT_POINT` 一致（預設 `/mnt/smb/illumio-backup`）：
    ```
-   //您的SMB伺服器/分享路徑 /mnt/smb  cifs  credentials=/root/smb.cred  0 0
+   //您的SMB伺服器/分享路徑 /mnt/smb/illumio-backup  cifs  credentials=/root/smb.cred  0 0
    ```
    ```bash
-   mkdir -p /mnt/smb && sudo mount -a
+   mkdir -p /mnt/smb/illumio-backup && sudo mount -a
    ```
 
 ### 4.2 準備 NFS 網路掛載 (若有需要)
@@ -95,12 +100,12 @@ ERROR: 請至少指定一個備份目的地 (--local / --smb / --nfs / --scp)
    ```bash
    dnf install nfs-utils -y
    ```
-2. **設定開機自動掛載 (`/etc/fstab`)**：
+2. **設定開機自動掛載 (`/etc/fstab`)** — 掛載點必須與腳本中的 `NFS_MOUNT_POINT` 一致（預設 `/mnt/nfs/illumio-backup`）：
    ```
-   您的NFS伺服器IP:/分享路徑 /mnt/nfs  nfs  defaults  0 0
+   您的NFS伺服器IP:/分享路徑 /mnt/nfs/illumio-backup  nfs  defaults  0 0
    ```
    ```bash
-   mkdir -p /mnt/nfs && sudo mount -a
+   mkdir -p /mnt/nfs/illumio-backup && sudo mount -a
    ```
 
 ### 4.3 準備 SCP 免密碼登入 (若有需要)
@@ -177,6 +182,9 @@ TRAFFIC_INTERVAL=7  # Traffic DB 備份間隔
   --min-free-local <GB>    本地最低剩餘空間（預設: 5）
   --min-free-share <GB>    SMB/NFS 最低剩餘空間（預設: 10）
   --min-free-remote <GB>   遠端主機最低剩餘空間（預設: 10）
+
+其他:
+  --help, -h               顯示說明並結束
 ```
 
 ### 5.2 常用範例
@@ -217,8 +225,8 @@ crontab -e
 - **`runtime_env.yml`**：每次符合頻率條件時備份（跟隨 `--db-interval`）
 - **Policy Database**：每次符合頻率條件時 Dump（跟隨 `--db-interval`）
 - **Traffic Database**：依 `--traffic-interval` 執行（預設每 7 天）；舊版的星期日硬編碼已移除
-- **日誌位置**：啟用 `--local` 時位於 `LOCAL_BACKUP_DIR/logs/`；未啟用時位於 `/tmp/illumio-backup/logs/`，同時寫入 syslog
-- **保留清理**：每次執行後，所有已啟用目的地都會自動清除超過保留天數的舊備份
+- **日誌位置**：啟用 `--local` 時位於 `LOCAL_BACKUP_DIR/logs/`；未啟用時位於 `/tmp/illumio-backup/logs/`，同時寫入 syslog；超過 30 天的 `backup_*.log` 會在每次成功執行結束時自動清除
+- **保留清理**：每次執行後，所有已啟用目的地都會自動清除超過保留天數的舊備份。**例外**：若本次任一備份任務硬失敗（沒有任何目的地寫入成功），本次的保留清理會被跳過，以保留現存舊備份避免「新失敗 + 舊被刪」
 - **沒有選目的地**：腳本立即印出錯誤並退出，不進行任何備份
 
 ---
