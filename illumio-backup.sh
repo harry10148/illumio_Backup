@@ -304,32 +304,36 @@ remote_days_since_last_backup() {
     echo "$DIFF"
 }
 
+# 取「最久沒備份」的目的地距今天數；只要任何一個啟用目的地缺檔或過期，就應觸發備份，
+# 確保新增目的地時也能補齊第一份備份。
 days_since_last_backup_enabled_destinations() {
     local PATTERN="$1"
-    local MIN_DAYS=9999
+    local MAX_DAYS=-1
     local DAYS
 
     if [[ "$ENABLE_LOCAL" == true ]]; then
         DAYS=$(days_since_last_backup "$LOCAL_BACKUP_DIR" "$PATTERN")
-        [[ "$DAYS" -lt "$MIN_DAYS" ]] && MIN_DAYS="$DAYS"
+        [[ "$DAYS" -gt "$MAX_DAYS" ]] && MAX_DAYS="$DAYS"
     fi
 
     if [[ "$ENABLE_SMB" == true ]] && is_smb_ready; then
         DAYS=$(days_since_last_backup "$SMB_MOUNT_POINT" "$PATTERN")
-        [[ "$DAYS" -lt "$MIN_DAYS" ]] && MIN_DAYS="$DAYS"
+        [[ "$DAYS" -gt "$MAX_DAYS" ]] && MAX_DAYS="$DAYS"
     fi
 
     if [[ "$ENABLE_NFS" == true ]] && is_nfs_ready; then
         DAYS=$(days_since_last_backup "$NFS_MOUNT_POINT" "$PATTERN")
-        [[ "$DAYS" -lt "$MIN_DAYS" ]] && MIN_DAYS="$DAYS"
+        [[ "$DAYS" -gt "$MAX_DAYS" ]] && MAX_DAYS="$DAYS"
     fi
 
     if [[ "$ENABLE_SCP" == true ]]; then
         DAYS=$(remote_days_since_last_backup "$PATTERN")
-        [[ "$DAYS" -lt "$MIN_DAYS" ]] && MIN_DAYS="$DAYS"
+        [[ "$DAYS" -gt "$MAX_DAYS" ]] && MAX_DAYS="$DAYS"
     fi
 
-    echo "$MIN_DAYS"
+    # 若沒有任何目的地產生有效讀數，視為從未備份
+    [[ "$MAX_DAYS" -lt 0 ]] && MAX_DAYS=9999
+    echo "$MAX_DAYS"
 }
 
 # ------------------------------------------------------------------------------
@@ -439,7 +443,7 @@ fi
 
 log "INFO" "偵測到備份主節點 IP: $LEADER_IP"
 
-if ! /usr/sbin/ip addr show 2>/dev/null | grep -q "$LEADER_IP"; then
+if ! /usr/sbin/ip -o addr show 2>/dev/null | grep -Eq "inet ${LEADER_IP}/"; then
     log "INFO" "[ROLE] 本節點非備份主節點 (主節點為 $LEADER_IP)，正常退出"
     exit 0
 else
@@ -465,6 +469,10 @@ if [[ "$ENABLE_NFS" == true ]] && is_nfs_ready; then
 fi
 
 if [[ "$ENABLE_SCP" == true ]]; then
+    # 先確保遠端目錄存在，避免首次部署時 df 對不存在路徑回空字串導致直接中止
+    if ! ssh -o ConnectTimeout=10 -o BatchMode=yes "$DR_USER@$DR_HOST" "mkdir -p '$DR_DEST_DIR'" 2>/dev/null; then
+        die "[SCP] 無法在遠端主機 ${DR_HOST} 建立 ${DR_DEST_DIR}，備份中止"
+    fi
     check_remote_disk_space "$MIN_FREE_GB_REMOTE"
 fi
 
@@ -572,6 +580,14 @@ fi
 # PHASE 3: Retention & Cleanup
 # ==============================================================================
 
+# 若任一任務硬失敗，跳過保留期清理，避免在新備份缺漏的情況下又刪掉舊備份
+if [[ "$HARD_FAILURE" == true ]]; then
+    log "WARN" "[CLEANUP] 偵測到備份硬失敗，本次跳過保留期清理以保留現有舊備份"
+    log "ERROR" "Backup Process Completed With Errors."
+    log "ERROR" "========================================="
+    exit 1
+fi
+
 log "INFO" "[CLEANUP] 執行保留政策: DB/Env (${RETENTION_DB_DAYS}d), Traffic (${RETENTION_TRAFFIC_DAYS}d)"
 
 # 清理指定目錄的舊備份 (不使用 eval，直接呼叫 find)
@@ -621,12 +637,6 @@ fi
 # 5. Log Cleanup (保留 30 天)
 log "INFO" "[CLEANUP] 清理舊 log 檔 (保留 30 天)..."
 find "$LOG_DIR" -type f -name 'backup_*.log' -mtime +30 -delete
-
-if [[ "$HARD_FAILURE" == true ]]; then
-    log "ERROR" "Backup Process Completed With Errors."
-    log "ERROR" "========================================="
-    exit 1
-fi
 
 log "INFO" "Backup Process Completed Successfully."
 log "INFO" "========================================="
